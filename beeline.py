@@ -4,6 +4,7 @@ import asyncio
 import aiohttp
 import copy
 import datetime
+import traceback
 import _pickle as pkl
 import sys, os
 
@@ -21,6 +22,7 @@ API_HEADERS = {
     'Accept-Encoding': 'gzip,deflate',
     'Host': 'my.beeline.ru',
     'Connection': 'Keep-Alive',
+    'Cookie': '',
     'Cookie2': '$Version=1'
 }
 
@@ -51,13 +53,13 @@ def write_log(data):
 async def login(phone):
 
     url = API_URL % phone
-    headers = API_HEADERS
+    headers = copy.deepcopy(API_HEADERS)
     data = {'password': PASS}
     headers.update({'Content-Length': str(len(str(data))) })
     # print(url, data)
     session = aiohttp.ClientSession(headers=headers)
 
-    async with session.put(url, json=data, timeout=5) as rsp:
+    async with session.put(url, json=data, timeout=15) as rsp:
         config = await rsp.json()
 
     if config['meta']['status'] != 'OK':
@@ -66,53 +68,56 @@ async def login(phone):
         return None, None
     else:
         print('[%s] Login OK' % phone)
-        return session, config
+        return session, {'token': 'token=%s' % config['token'], 'srv': rsp.headers['Set-Cookie'].split(';')[0]}
 
 
 async def get_balanse(session, phone):
     url = API_BALANCE % phone
 
-    async with session.get(url, timeout=5) as rsp:
+    async with session.get(url, timeout=15) as rsp:
         res = await rsp.json()
 
     if res['meta']['status'] != 'OK':
         print('[%s] Error get balance : %s' % (phone, res))
         return None
     else:
-        return '%s%s' % (res['balance'], res['currency'])
+        return '%s%s' % (res.get('balance', 'NULL'),
+                         res.get('currency', 'NULL'))
 
 
 async def get_price(session, phone):
     url = API_PRICE % phone
 
-    async with session.get(url, timeout=5) as rsp:
+    async with session.get(url, timeout=15) as rsp:
         res = await rsp.json()
 
     if res['meta']['status'] != 'OK':
         print('[%s] Error get price : %s' % (phone, res))
     else:
         plan = res['pricePlanInfo']
-        return '%s\t%s\t%s' % (plan['entityName'], plan['rcRate'], plan['rcRatePeriodText'])
+        return '%s\t%s\t%s' % (plan.get('entityName', 'NULL'),
+                               plan.get('rcRate', 'NULL'),
+                               plan.get('rcRatePeriodText', 'NULL'))
 
 
 async def wrk(config, tel):
     await LOCK.acquire()
 
     if config.get(tel) is None:
-        print('[%s] Use auth metod' % tel)
+        print('[%s] Use auth method' % tel)
         session, cfg = await login(tel)
         if cfg is None:
+            LOCK.release()
             return
-        session.cookie_jar.update_cookies({'token': cfg['token']},
-                                          response_url=aiohttp.cookiejar.URL('https://my.beeline.ru/'))
-        config.update({tel: copy.deepcopy(session.cookie_jar._cookies)})
+        config.update({tel: cfg})
         await session.close()
     else:
         print('[%s] Use saved data' % tel)
 
-    cookies = config[tel]
-    session = aiohttp.ClientSession(headers=API_HEADERS)
-    session.cookie_jar._cookies = cookies
+    conf = config[tel]
+    headers = copy.deepcopy(API_HEADERS)
+    headers['Cookie'] = '%s; %s' % (conf['srv'], conf['token'])
+    session = aiohttp.ClientSession(headers=headers)
 
     save_config(config)
 
@@ -120,10 +125,11 @@ async def wrk(config, tel):
         bal = await get_balanse(session, tel)
         price = await get_price(session, tel)
         write_log('%s\t%s\t%s' % (tel, bal,price))
+        print('[%s] Data OK' % tel)
         await session.close()
-    except Exception as e:
+    except:
         await session.close()
-        print(e)
+        print('[%s] Error: %s' % (tel, traceback.format_exc()))
 
     LOCK.release()
 
@@ -131,7 +137,7 @@ async def wrk(config, tel):
 if __name__ == '__main__':
 
     if len(sys.argv) < 3:
-        print('beeline.py spisok_telephonov.txt num_threads\n\nSpisok nomerov dolzhen soderzhat 10 tsifr! (primer 9641234567)')
+        print('beeline.py spisok_telephonov.txt num_threads\n\nSpisok nomerov dolzhen soderzhat tolko 10 tsifr!')
         exit()
 
     telsp = sys.argv[1]
@@ -148,10 +154,23 @@ if __name__ == '__main__':
     config = parse_config()
     futures = []
 
-    for tel in tells:
-        tel = tel.strip()
-        futures.append(wrk(config, tel))
-
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(asyncio.gather(*futures))
+
+    for tel in tells:
+
+        _tel = ''
+        for q in tel:
+            if q in '0123456789':
+                _tel += q
+        tel = _tel
+
+        if not tel:
+            continue
+        task = loop.create_task(wrk(config, tel))
+        futures.append(task)
+
+    print('Loaded %d nums.' % len(futures))
+
+    wait_tasks = asyncio.wait(futures)
+    loop.run_until_complete(wait_tasks)
     loop.close()
